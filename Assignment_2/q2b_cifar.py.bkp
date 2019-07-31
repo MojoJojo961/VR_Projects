@@ -1,0 +1,172 @@
+from os.path import exists, isdir, basename, join, splitext
+from glob import glob
+from numpy import zeros, resize, sqrt, histogram, hstack, vstack, savetxt, zeros_like
+import scipy.cluster.vq as vq
+import libsvm
+import pickle
+from pickle import dump, HIGHEST_PROTOCOL
+import argparse
+import cv2
+import numpy as np
+
+
+EXTENSIONS = [".jpg", ".bmp", ".png", ".pgm", ".tif", ".tiff"]
+DATASETPATH = '../dataset'
+PRE_ALLOCATION_BUFFER = 1000  # for sift
+HISTOGRAMS_FILE = 'trainingdata_cifar.svm'
+K_THRESH = 1  # early stopping threshold for kmeans originally at 1e-5, increased for speedup
+CODEBOOK_FILE = 'codebook_cifar.file'
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='train a visual bag of words model')
+    parser.add_argument('-d', help='path to the dataset', required=False, default=DATASETPATH)
+    args = parser.parse_args()
+    return args
+
+
+def get_categories(datasetpath):
+    with open(datasetpath+"batches.meta", 'rb') as f:
+        data = pickle.load(f, encoding='UTF-8')
+        cats = data['label_names']
+    return cats
+
+
+def get_imgfiles(path):
+    all_files = []
+    all_files.extend([join(path, basename(fname))
+                    for fname in glob(path + "/*")])
+    return all_files
+
+
+def extractSift(input_array, num):
+    print("extracting Sift features for {}".format(num))
+    all_features_dict = {}
+    img = np.array(input_array)
+    img = np.transpose(np.reshape(img,(3, 32,32)), (1,2,0))
+    #image = cv2.imread(img)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    print(img)
+    print(img.shape)
+    sift = cv2.xfeatures2d.SIFT_create()
+    keypt, desc = sift.detectAndCompute(img, None)
+    print(desc)
+    print(desc.shape)
+    all_features_dict[num] = desc
+    return all_features_dict
+
+
+def dict2numpy(dict):
+    nkeys = len(dict)
+    array = zeros((nkeys * PRE_ALLOCATION_BUFFER, 128))
+    pivot = 0
+    for key in dict.keys():
+        value = dict[key]
+        nelements = value.shape[0]
+        while pivot + nelements > array.shape[0]:
+            padding = zeros_like(array)
+            array = vstack((array, padding))
+        array[pivot:pivot + nelements] = value
+        pivot += nelements
+    array = resize(array, (pivot, 128))
+    return array
+
+
+def computeHistograms(codebook, descriptors):
+    code, dist = vq.vq(descriptors, codebook)
+    histogram_of_words, bin_edges = histogram(code,
+                                              bins=range(codebook.shape[0] + 1),
+                                              #normed=True)
+                                              density=True)
+    return histogram_of_words
+
+
+def writeHistogramsToFile(nwords, labels, fnames, all_word_histgrams, features_fname):
+    data_rows = zeros(nwords + 1)  # +1 for the category label
+    for fname in fnames:
+        histogram = all_word_histgrams[fname]
+        if (histogram.shape[0] != nwords):  # scipy deletes empty clusters
+            nwords = histogram.shape[0]
+            data_rows = zeros(nwords + 1)
+            print('nclusters have been reduced to ' + str(nwords))
+        data_row = hstack((labels[fname], histogram))
+        data_rows = vstack((data_rows, data_row))
+    data_rows = data_rows[1:]
+    fmt = '%i '
+    for i in range(1, nwords+1):
+        fmt = fmt + str(i) + ':%f '
+    savetxt(features_fname, data_rows, fmt)
+
+
+if __name__ == '__main__':
+    print("---------------------")
+    print("## loading the images and extracting the sift features")
+    args = parse_arguments()
+    datasetpath = args.d
+    cats = get_categories(datasetpath)
+    ncats = len(cats)
+    if ncats < 1:
+        raise ValueError('Only ' + str(ncats) + ' categories found. Wrong path?')
+    print("found following categories:")
+    print(cats)
+    print("---------------------")
+    #exit(0)
+    all_files = []
+    all_files_labels = {}
+    all_features = {}
+    cat_label = {}
+    with open(datasetpath+'data_batch_1', 'rb') as f:
+        tmp_data = pickle.load(f, encoding='bytes')
+    i = 1
+    for cat, label in zip(tmp_data[b'data'], tmp_data[b'labels']):
+        # cat is a numpy array of dim 1*3072
+        # labels are the label given to the ith image in the array data
+
+        #cat_path = join(datasetpath, cat)
+        #cat_files = get_imgfiles(cat_path)
+        cat_features = extractSift(cat, i)
+        all_files.append(str(i))
+        all_features.update(cat_features)
+        cat_label[i] = label
+        all_files_labels[i] = label
+        i += 1
+
+    print("---------------------")
+    print("## computing the visual words via k-means")
+    all_features_array = dict2numpy(all_features)
+    nfeatures = all_features_array.shape[0]
+    nclusters = int(sqrt(nfeatures))
+    codebook, distortion = vq.kmeans(all_features_array,
+                                             nclusters,
+                                             thresh=K_THRESH)
+
+    with open(datasetpath + CODEBOOK_FILE, 'wb') as f:
+        dump(codebook, f, protocol=HIGHEST_PROTOCOL)
+
+    print("---------------------")
+    print("## compute the visual words histograms for each image")
+    all_word_histgrams = {}
+    for imagefname in all_features:
+        word_histgram = computeHistograms(codebook, all_features[imagefname])
+        all_word_histgrams[imagefname] = word_histgram
+
+    print("---------------------")
+    print("## write the histograms to file to pass it to the svm")
+    writeHistogramsToFile(nclusters,
+                          all_files_labels,
+                          all_files,
+                          all_word_histgrams,
+                          datasetpath + HISTOGRAMS_FILE)
+
+    print("---------------------")
+    print("## train svm")
+    c, g, rate, model_file = libsvm.grid(datasetpath + HISTOGRAMS_FILE,
+                                         png_filename='grid_res_img_file.png')
+
+    print("--------------------")
+    print("## outputting results")
+    print("model file: " + datasetpath + model_file)
+    print("codebook file: " + datasetpath + CODEBOOK_FILE)
+    print("category      ==>  label")
+    for cat in cat_label:
+        print('{0:13} ==> {1:6d}'.format(cat, cat_label[cat]))
